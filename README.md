@@ -47,8 +47,7 @@ Variáveis de ambiente (opcionais):
 | `DATABASE_URL` | PostgreSQL (histórico de partidas) | desligado |
 | `AUTO_MIGRATE` | aplica as migrations no arranque | `false` |
 | `GWF_LOG_FORMAT` | formato dos logs estruturados: `text` ou `json` | `text` |
-| `GWF_COOKIE_SECURE` | marca o cookie CSRF como `Secure` (`true` em produção HTTPS) | `false` |
-| `GWF_COOKIE_SAMESITE` | `SameSite` do cookie CSRF: `Lax`, `Strict` ou `None` | `Lax` |
+| `GWF_CSRF_SECRET` | segredo (hex) para assinar tokens CSRF; se vazio, é gerado no arranque (tokens reiniciam) | gerado |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | endpoint OTLP/HTTP (ex: `http://collector:4318`) — liga tracing OpenTelemetry | desligado |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | endpoint OTLP específico de traces (substitui o anterior) | — |
 | `OTEL_TRACES_EXPORTER` | define `none` para desligar explicitamente o tracing | — |
@@ -63,10 +62,12 @@ Variáveis de ambiente (opcionais):
 
 ## Segurança
 
-- **CSRF:** token duplo (`gwf_csrf` cookie + header `X-CSRF-Token`). O
-  frontend obtém o token via `GET /api/csrf` antes de qualquer POST. Se o
-  frontend e a API estiverem em sites diferentes, define
-  `GWF_COOKIE_SAMESITE=None` e `GWF_COOKIE_SECURE=true`.
+- **CSRF:** token assinado (HMAC-SHA256) emitido por `GET /api/csrf` e enviado
+  no header `X-CSRF-Token` em métodos que alteram estado. Sem cookies — funciona
+  entre sites (Vercel → API) mesmo com third-party cookies bloqueados. Define
+  `GWF_CSRF_SECRET` (hex) para tokens estáveis entre reinícios.
+- **CORS:** com `CORS_ORIGINS` explícito (ex: `https://frontend.meusite.com`) o
+  backend permite credenciais e o preflight aceita `X-CSRF-Token`.
 
 ## Migrations (PostgreSQL)
 
@@ -118,8 +119,6 @@ também precisa de:
 
 ```bash
 CORS_ORIGINS=https://frontend.meusite.com   # domínio do frontend, não "*"
-GWF_COOKIE_SAMESITE=None                    # cookie CSRF entre sites
-GWF_COOKIE_SECURE=true                      # requer HTTPS
 ```
 
 ## Testes

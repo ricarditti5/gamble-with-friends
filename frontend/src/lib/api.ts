@@ -3,22 +3,17 @@ import type { RoomLookup } from "../types";
 // Tolerante a barra final em VITE_API_URL (ex: "https://x.com/").
 const API = (import.meta.env.VITE_API_URL ?? "").replace(/\/+$/, "");
 
-// Double-submit CSRF: the backend sets a `gwf_csrf` cookie on every response;
-// unsafe methods must echo the token in X-CSRF-Token.
-const CSRF_COOKIE = "gwf_csrf";
+// CSRF: o backend emite um token assinado em GET /api/csrf; métodos que mudam
+// estado enviam-no no header X-CSRF-Token. O token vive em memória (sem
+// cookies — funciona entre sites mesmo com third-party cookies bloqueados).
 let csrfToken: string | null = null;
-
-function readCookie(name: string): string | null {
-  const m = document.cookie.match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
-  return m ? decodeURIComponent(m[1]) : null;
-}
 
 async function ensureCsrf(): Promise<string> {
   if (csrfToken) return csrfToken;
   const res = await fetch(`${API}/api/csrf`, { credentials: "include" });
   const body = await res.json().catch(() => ({}));
-  csrfToken = (body as { token?: string }).token ?? readCookie(CSRF_COOKIE);
-  return csrfToken ?? "";
+  csrfToken = (body as { token?: string }).token ?? "";
+  return csrfToken;
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {

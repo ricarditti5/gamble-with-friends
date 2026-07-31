@@ -4,7 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +28,7 @@ type Server struct {
 	Manager *room.Manager
 	app     *fiber.App
 	tracer  trace.Tracer
+	csrf    *csrfTokens
 }
 
 func New(manager *room.Manager, allowedOrigins string) *Server {
@@ -40,16 +40,21 @@ func New(manager *room.Manager, allowedOrigins string) *Server {
 		AllowHeaders: "Content-Type, X-CSRF-Token",
 	}
 	// Wildcard + credentials is invalid; when an explicit origin list is
-	// configured, echo credentials so the CSRF cookie survives CORS.
+	// configured, echo credentials for cross-site use.
 	if allowedOrigins != "*" {
 		corsCfg.AllowCredentials = true
 	}
 	app.Use(cors.New(corsCfg))
 
+	tokens, err := newCsrfTokens()
+	if err != nil {
+		slog.Error("csrf setup failed", "error", err)
+	}
 	s := &Server{
 		Manager: manager,
 		app:     app,
 		tracer:  otel.GetTracerProvider().Tracer(appotel.ServiceName),
+		csrf:    tokens,
 	}
 	s.routes()
 	return s
@@ -71,9 +76,14 @@ func (s *Server) routes() {
 	})
 
 	api := s.app.Group("/api")
-	api.Use(s.otelMiddleware(), csrfMiddleware(secureCookies(), csrfSameSite()))
+	api.Use(s.otelMiddleware(), csrfMiddleware(s.csrf))
 	api.Get("/csrf", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{"token": c.Locals(csrfLocalsKey)})
+		token, err := s.csrf.issue()
+		if err != nil {
+			slog.Error("csrf issue failed", "error", err)
+			return c.Status(500).JSON(fiber.Map{"error": "internal error"})
+		}
+		return c.JSON(fiber.Map{"token": token})
 	})
 	api.Post("/rooms", s.handleCreateRoom)
 	api.Get("/rooms/:code", s.handleGetRoom)
@@ -302,24 +312,10 @@ func (s *Server) handleWS(conn *websocket.Conn) {
 		}
 	}
 
-	if joinedSession != "" {
+		if joinedSession != "" {
 		slog.Info("ws leave", "room", roomCode, "session_id", joinedSession)
 		resp := make(chan error, 1)
 		r.Command(room.Command{Kind: room.CmdLeave, SessionID: joinedSession, Resp: resp})
 		<-resp
 	}
-}
-
-func secureCookies() bool {
-	return strings.EqualFold(os.Getenv("GWF_COOKIE_SECURE"), "true")
-}
-
-func csrfSameSite() string {
-	switch strings.ToLower(os.Getenv("GWF_COOKIE_SAMESITE")) {
-	case "none":
-		return "None"
-	case "strict":
-		return "Strict"
-	}
-	return "Lax"
 }
