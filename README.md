@@ -94,6 +94,34 @@ npm run dev       # http://localhost:5173 (proxy para o backend :8080)
 
 Build de produção: `npm run build` (output em `frontend/dist`).
 
+### Ligar o frontend ao backend (produção)
+
+O frontend só sabe onde está o backend através de variáveis de ambiente do
+Vite (`VITE_*`). São injectadas **em tempo de build** — copia
+`frontend/.env.example` para `frontend/.env`, define os URLs e volta a correr
+`npm run build`:
+
+```bash
+cd frontend
+cp .env.example .env
+# edita .env: VITE_API_URL e VITE_WS_URL
+npm run build
+```
+
+| Variável | Descrição | Default |
+|---|---|---|
+| `VITE_API_URL` | URL do backend para os pedidos HTTP (ex: `https://api.meusite.com`) | vazio (usa o mesmo host) |
+| `VITE_WS_URL` | URL do backend para o WebSocket (ex: `wss://api.meusite.com`) | vazio (usa o mesmo host) |
+
+Se o frontend e o backend estiverem em **domínios diferentes**, o backend
+também precisa de:
+
+```bash
+CORS_ORIGINS=https://frontend.meusite.com   # domínio do frontend, não "*"
+GWF_COOKIE_SAMESITE=None                    # cookie CSRF entre sites
+GWF_COOKIE_SECURE=true                      # requer HTTPS
+```
+
 ## Testes
 
 ```bash

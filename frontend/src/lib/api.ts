@@ -1,6 +1,7 @@
 import type { RoomLookup } from "../types";
 
-const API = import.meta.env.VITE_API_URL ?? "";
+// Tolerante a barra final em VITE_API_URL (ex: "https://x.com/").
+const API = (import.meta.env.VITE_API_URL ?? "").replace(/\/+$/, "");
 
 // Double-submit CSRF: the backend sets a `gwf_csrf` cookie on every response;
 // unsafe methods must echo the token in X-CSRF-Token.
@@ -33,7 +34,13 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error((body as { error?: string }).error ?? `HTTP ${res.status}`);
+    const err = (body as { error?: string }).error ?? `HTTP ${res.status}`;
+    // Sem VITE_API_URL definido no build, os pedidos vão para o host do
+    // frontend (que não tem /api) e falham com 404.
+    if (!API && (res.status === 404 || res.status === 405)) {
+      throw new Error(`${err} — backend não configurado. Define VITE_API_URL no build (frontend/.env) e volta a fazer deploy.`);
+    }
+    throw new Error(err);
   }
   return body as T;
 }

@@ -28,7 +28,7 @@ export class GameClient {
   }
 
   private wsUrl(): string {
-    const base = import.meta.env.VITE_WS_URL ?? "";
+    const base = (import.meta.env.VITE_WS_URL ?? "").replace(/\/+$/, "");
     if (base) return `${base}/ws?room=${encodeURIComponent(this.roomCode)}`;
     const proto = location.protocol === "https:" ? "wss" : "ws";
     return `${proto}://${location.host}/ws?room=${encodeURIComponent(this.roomCode)}`;
