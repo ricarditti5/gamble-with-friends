@@ -1,0 +1,16 @@
+# Go
+backend/bin/
+backend/*.exe
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Env
+.env
+.env.local
+
+# Misc
+.DS_Store
+*.log
