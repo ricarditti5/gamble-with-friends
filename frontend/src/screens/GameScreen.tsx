@@ -48,7 +48,7 @@ function reducer(g: GameState, a: Action): GameState {
       return {
         ...g,
         state: a.msg,
-        showdown: a.msg.state.hand_over ? g.showdown : null,
+        showdown: a.msg.state?.hand_over ? g.showdown : null,
         matchOver: a.msg.room.status === "finished" ? g.matchOver : null,
       };
     case "showdown":
@@ -273,7 +273,7 @@ export function GameScreen({ session, roomCode, onLeave }: {
 
       {game.state && !waiting && (
         <div className="hand-info">
-          Mão #{game.state.state.hand_number} ·{" "}
+          Mão #{state?.hand_number} ·{" "}
           {state?.pot.toLocaleString("pt-PT")} no pot
         </div>
       )}

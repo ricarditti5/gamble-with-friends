@@ -75,9 +75,10 @@ export interface GameStateMsg {
   seats: SeatInfo[];
   log: LogEntry[];
   remaining: number;
-  state: PublicState;
-  your_cards: Card[];
-  your_idx: number;
+  /** Present only while a match is running (absent in the waiting room). */
+  state?: PublicState;
+  your_cards?: Card[];
+  your_idx?: number;
   /** Result of the finished match; present when room.status === "finished". */
   champion?: MatchOverMsg["payload"];
 }
