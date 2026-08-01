@@ -52,6 +52,8 @@ export interface SeatInfo {
   session_id: string;
   nickname: string;
   is_host: boolean;
+  is_bot?: boolean;
+  disconnected?: boolean;
 }
 
 export interface LogEntry {
@@ -76,6 +78,8 @@ export interface GameStateMsg {
   state: PublicState;
   your_cards: Card[];
   your_idx: number;
+  /** Result of the finished match; present when room.status === "finished". */
+  champion?: MatchOverMsg["payload"];
 }
 
 export interface ShowdownWinner {

@@ -38,8 +38,12 @@ func mustCommand(t *testing.T, r *Room, cmd Command) {
 }
 
 func waitFor(t *testing.T, cond func() bool, what string) {
+	waitForDur(t, 5*time.Second, cond, what)
+}
+
+func waitForDur(t *testing.T, timeout time.Duration, cond func() bool, what string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
@@ -87,6 +91,7 @@ func TestRoomActionValidation(t *testing.T) {
 }
 
 func TestRoomKickInWaiting(t *testing.T) {
+
 	r := newTestRoom(t)
 	testClient(t, r, "host-uuid", "host")
 	c2 := testClient(t, r, "p2-uuid", "p2")
@@ -179,5 +184,132 @@ func TestRoomSecondMatchResetsChips(t *testing.T) {
 	}
 	if r.Status() != StatusInProgress {
 		t.Fatalf("status = %v, want in_progress", r.Status())
+	}
+}
+
+func TestRoomAddBotAndPlay(t *testing.T) {
+	r := newTestRoom(t)
+	testClient(t, r, "host-uuid", "host")
+
+	mustCommand(t, r, Command{Kind: CmdAddBot, SessionID: "host-uuid"})
+	mustCommand(t, r, Command{Kind: CmdAddBot, SessionID: "host-uuid"})
+	if got := r.PlayerCount(); got != 3 {
+		t.Fatalf("player count = %d, want 3", got)
+	}
+	// Non-host cannot add bots.
+	testClient(t, r, "other-uuid", "other")
+	resp := make(chan error, 1)
+	r.Command(Command{Kind: CmdAddBot, SessionID: "other-uuid", Resp: resp})
+	if err := <-resp; err == nil {
+		t.Error("non-host add_bot should fail")
+	}
+	// Remove the extra human so the match runs with host + bots.
+	resp = make(chan error, 1)
+	r.Command(Command{Kind: CmdLeave, SessionID: "other-uuid", Immediate: true, Resp: resp})
+	if err := <-resp; err != nil {
+		t.Fatalf("leave failed: %v", err)
+	}
+
+	mustCommand(t, r, Command{Kind: CmdStart, SessionID: "host-uuid"})
+	if r.Status() != StatusInProgress {
+		t.Fatalf("status = %v, want in_progress", r.Status())
+	}
+	// Bots act automatically: the hand must finish without human actions.
+	// A full street-by-street hand can take ~12s with bot delays.
+	waitForDur(t, 25*time.Second, func() bool {
+		_, handOver := r.EngineStatus()
+		return handOver
+	}, "hand to finish with bots playing")
+
+	// Bots cannot be added or removed mid-game.
+	resp = make(chan error, 1)
+	r.Command(Command{Kind: CmdRemoveBot, SessionID: "host-uuid", Target: "bot-1", Resp: resp})
+	if err := <-resp; err == nil {
+		t.Error("removing a bot mid-game should fail")
+	}
+}
+
+func TestRoomRemoveBotWaiting(t *testing.T) {
+	r := newTestRoom(t)
+	testClient(t, r, "host-uuid", "host")
+	mustCommand(t, r, Command{Kind: CmdAddBot, SessionID: "host-uuid"})
+	mustCommand(t, r, Command{Kind: CmdAddBot, SessionID: "host-uuid"})
+
+	mustCommand(t, r, Command{Kind: CmdRemoveBot, SessionID: "host-uuid", Target: "bot-1"})
+	if got := r.PlayerCount(); got != 2 {
+		t.Fatalf("player count = %d, want 2 after removing a bot", got)
+	}
+	resp := make(chan error, 1)
+	r.Command(Command{Kind: CmdRemoveBot, SessionID: "host-uuid", Target: "bot-1", Resp: resp})
+	if err := <-resp; err == nil {
+		t.Error("removing a bot twice should fail")
+	}
+}
+
+func TestRoomHeadsUpBlindChoice(t *testing.T) {
+	r := newTestRoom(t)
+	testClient(t, r, "host-uuid", "host")
+	testClient(t, r, "p2-uuid", "p2")
+
+	// Host picks p2 as the big blind; host must become dealer (small blind).
+	mustCommand(t, r, Command{Kind: CmdStart, SessionID: "host-uuid", Target: "p2-uuid"})
+
+	if r.engine == nil {
+		t.Fatal("engine not started")
+	}
+	players := r.engine.Players()
+	if players[0].SessionID != "host-uuid" || players[1].SessionID != "p2-uuid" {
+		t.Fatalf("unexpected player order: %s, %s", players[0].SessionID, players[1].SessionID)
+	}
+	if got := r.engine.DealerIdx(); got != 0 {
+		t.Errorf("dealer = %d, want 0 (host as small blind)", got)
+	}
+	if got := players[1].BetThisRound; got != r.config.BigBlind {
+		t.Errorf("p2 big blind = %d, want %d", got, r.config.BigBlind)
+	}
+	if got := players[0].BetThisRound; got != r.config.SmallBlind {
+		t.Errorf("host small blind = %d, want %d", got, r.config.SmallBlind)
+	}
+}
+
+func TestRoomWaitingDisconnectExpire(t *testing.T) {
+	r := newTestRoom(t)
+	r.disconnectGrace = 150 * time.Millisecond
+	testClient(t, r, "host-uuid", "host")
+	testClient(t, r, "p2-uuid", "p2")
+
+	// Dropped connection (refresh): seat is kept, marked disconnected.
+	resp := make(chan error, 1)
+	r.Command(Command{Kind: CmdLeave, SessionID: "p2-uuid", Resp: resp})
+	if err := <-resp; err != nil {
+		t.Fatalf("leave failed: %v", err)
+	}
+	if r.PlayerCount() != 2 {
+		t.Fatalf("player count = %d, want 2 (seat kept on disconnect)", r.PlayerCount())
+	}
+
+	// A refresh reconnects with the same session: seat is reclaimed.
+	testClient(t, r, "p2-uuid", "p2")
+	resp = make(chan error, 1)
+	r.Command(Command{Kind: CmdLeave, SessionID: "p2-uuid", Resp: resp})
+	<-resp
+
+	// No reconnect within the grace period: seat expires.
+	waitFor(t, func() bool { return r.PlayerCount() == 1 }, "disconnected seat to expire")
+}
+
+func TestRoomExplicitLeaveRemovesSeat(t *testing.T) {
+	r := newTestRoom(t)
+	r.disconnectGrace = time.Hour
+	testClient(t, r, "host-uuid", "host")
+	testClient(t, r, "p2-uuid", "p2")
+
+	resp := make(chan error, 1)
+	r.Command(Command{Kind: CmdLeave, SessionID: "p2-uuid", Immediate: true, Resp: resp})
+	if err := <-resp; err != nil {
+		t.Fatalf("leave failed: %v", err)
+	}
+	if r.PlayerCount() != 1 {
+		t.Errorf("player count = %d, want 1 after explicit leave", r.PlayerCount())
 	}
 }

@@ -19,8 +19,8 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
 
-	appotel "gamblefriends/backend/internal/otel"
 	"gamblefriends/backend/internal/db"
+	appotel "gamblefriends/backend/internal/otel"
 	"gamblefriends/backend/internal/room"
 )
 
@@ -206,11 +206,12 @@ func (s *Server) handleGetRoomConfig(c *fiber.Ctx) error {
 }
 
 type wsMessage struct {
-	Type      string `json:"type"`
-	SessionID string `json:"session_id"`
-	Nickname  string `json:"nickname"`
-	Action    string `json:"action"`
-	Amount    int    `json:"amount"`
+	Type            string `json:"type"`
+	SessionID       string `json:"session_id"`
+	Nickname        string `json:"nickname"`
+	Action          string `json:"action"`
+	Amount          int    `json:"amount"`
+	BigBlindSession string `json:"big_blind_session"`
 }
 
 func (s *Server) handleWS(conn *websocket.Conn) {
@@ -305,11 +306,43 @@ func (s *Server) handleWS(conn *websocket.Conn) {
 				continue
 			}
 			resp := make(chan error, 1)
-			r.Command(room.Command{Kind: room.CmdStart, SessionID: joinedSession, Resp: resp})
+			r.Command(room.Command{Kind: room.CmdStart, SessionID: joinedSession, Target: msg.BigBlindSession, Resp: resp})
 			if err := <-resp; err != nil {
 				slog.Warn("ws start: rejected", "room", roomCode, "session_id", joinedSession, "error", err)
 				conn.WriteJSON(fiber.Map{"type": "error", "payload": err.Error()})
 			}
+
+		case "add_bot":
+			if joinedSession == "" {
+				continue
+			}
+			resp := make(chan error, 1)
+			r.Command(room.Command{Kind: room.CmdAddBot, SessionID: joinedSession, Resp: resp})
+			if err := <-resp; err != nil {
+				slog.Warn("ws add_bot: rejected", "room", roomCode, "session_id", joinedSession, "error", err)
+				conn.WriteJSON(fiber.Map{"type": "error", "payload": err.Error()})
+			}
+
+		case "remove_bot":
+			if joinedSession == "" {
+				continue
+			}
+			resp := make(chan error, 1)
+			r.Command(room.Command{Kind: room.CmdRemoveBot, SessionID: joinedSession, Target: msg.SessionID, Resp: resp})
+			if err := <-resp; err != nil {
+				slog.Warn("ws remove_bot: rejected", "room", roomCode, "session_id", joinedSession, "target", msg.SessionID, "error", err)
+				conn.WriteJSON(fiber.Map{"type": "error", "payload": err.Error()})
+			}
+
+		case "leave":
+			if joinedSession == "" {
+				continue
+			}
+			resp := make(chan error, 1)
+			r.Command(room.Command{Kind: room.CmdLeave, SessionID: joinedSession, Immediate: true, Resp: resp})
+			<-resp
+			conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+			return
 
 		case "kick":
 			if joinedSession == "" {
@@ -324,7 +357,7 @@ func (s *Server) handleWS(conn *websocket.Conn) {
 		}
 	}
 
-		if joinedSession != "" {
+	if joinedSession != "" {
 		slog.Info("ws leave", "room", roomCode, "session_id", joinedSession)
 		resp := make(chan error, 1)
 		r.Command(room.Command{Kind: room.CmdLeave, SessionID: joinedSession, Resp: resp})

@@ -365,6 +365,77 @@ button {
   color: var(--muted);
 }
 
+/* ---------- Players sidebar ---------- */
+
+.players {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.player-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  background: var(--panel-2);
+  border: 1px solid transparent;
+}
+
+.player-row.turn {
+  border-color: var(--amber);
+  box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.3);
+}
+
+.player-row.folded,
+.player-row.spectator {
+  opacity: 0.45;
+}
+
+.player-row.offline {
+  opacity: 0.6;
+}
+
+.player-row .avatar {
+  width: 30px;
+  height: 30px;
+  font-size: 13px;
+  flex-shrink: 0;
+}
+
+.player-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.player-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.player-sub {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.badge.host {
+  background: var(--accent);
+  color: #fff;
+}
+
+.badge.ai {
+  background: var(--red);
+  color: #fff;
+}
+
 /* ---------- Table ---------- */
 
 .table-wrap {
@@ -659,6 +730,15 @@ button {
   border-radius: 20px;
   padding: 5px 12px 5px 5px;
   font-size: 13px;
+}
+
+.lobby-seat.offline {
+  opacity: 0.55;
+}
+
+.blind-pick {
+  width: 100%;
+  text-align: left;
 }
 
 .muted {

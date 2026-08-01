@@ -2,6 +2,8 @@
 // No accounts — the session id is the only identity.
 
 const KEY = "gwf.session";
+const ROOM_KEY = "gwf.room";
+const LEFT_KEY = "gwf.leftAt";
 
 export interface Session {
   session_id: string;
@@ -52,4 +54,35 @@ export function updateNickname(nickname: string): Session {
   const s: Session = { session_id: cur.session_id, nickname: nickname.trim().slice(0, 20) };
   localStorage.setItem(KEY, JSON.stringify(s));
   return s;
+}
+
+// Room membership is persisted so a page refresh returns to the same room.
+// It is only cleared when the player leaves explicitly (Sair button) or when
+// the room is gone/expired on the server.
+
+export function saveRoom(code: string): void {
+  localStorage.setItem(ROOM_KEY, code);
+}
+
+export function loadRoom(): string | null {
+  return localStorage.getItem(ROOM_KEY);
+}
+
+export function clearRoom(): void {
+  localStorage.removeItem(ROOM_KEY);
+}
+
+// pagehide runs on both refresh and tab close; the timestamp lets the next
+// load distinguish a quick refresh (rejoin) from a real tab close (leave).
+export function markLeft(): void {
+  localStorage.setItem(LEFT_KEY, String(Date.now()));
+}
+
+// Returns true when the page was closed for a long time (e.g. the tab was
+// closed and reopened later). Consumes the timestamp.
+export function wasClosedLongAgo(graceMs = 30000): boolean {
+  const raw = localStorage.getItem(LEFT_KEY);
+  if (!raw) return false;
+  localStorage.removeItem(LEFT_KEY);
+  return Date.now() - Number(raw) > graceMs;
 }

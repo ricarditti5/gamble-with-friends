@@ -207,6 +207,9 @@ func (e *Engine) HoleCards(idx int) []Card {
 
 func (e *Engine) CurrentBet() int { return e.currentBet }
 
+// MinRaise returns the minimum raise increment for the current street.
+func (e *Engine) MinRaise() int { return e.lastRaise }
+
 func (e *Engine) PlayerIndex(sessionID string) int {
 	for i, p := range e.players {
 		if p.SessionID == sessionID {
@@ -218,6 +221,17 @@ func (e *Engine) PlayerIndex(sessionID string) int {
 
 // StartHand resets all hand state, rotates the dealer, posts blinds and deals.
 func (e *Engine) StartHand() error {
+	return e.startHand(-1)
+}
+
+// StartHandWithDealer starts a new hand with the given player as the dealer
+// instead of rotating. Used to honor a chosen blind assignment in heads-up
+// games (there the dealer is the small blind).
+func (e *Engine) StartHandWithDealer(dealerIdx int) error {
+	return e.startHand(dealerIdx)
+}
+
+func (e *Engine) startHand(dealerOverride int) error {
 	e.handNumber++
 	e.community = nil
 	e.pot = 0
@@ -247,7 +261,9 @@ func (e *Engine) StartHand() error {
 	}
 
 	n := len(e.players)
-	if e.dealerIdx < 0 {
+	if dealerOverride >= 0 {
+		e.dealerIdx = dealerOverride % n
+	} else if e.dealerIdx < 0 {
 		e.dealerIdx = active[0]
 	} else {
 		for {

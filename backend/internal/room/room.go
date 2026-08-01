@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"math/big"
+	mathrand "math/rand"
 	"sync"
 	"time"
 
@@ -57,7 +58,12 @@ type Seat struct {
 	SessionID string
 	Nickname  string
 	IsHost    bool
+	IsBot     bool // computer player; acts automatically
 	Removed   bool // kicked mid-game; leaves after the current hand
+	// Disconnected: waiting-room seat whose connection dropped. Kept for a
+	// grace period so a page refresh reclaims the same seat; expired by
+	// handleExpireLeave otherwise.
+	Disconnected bool
 }
 
 // Client is a connected WebSocket session.
@@ -106,13 +112,15 @@ type Room struct {
 	done     chan struct{}
 	wg       sync.WaitGroup
 
-	timer         *time.Timer
-	pendingNext   bool
-	actionTimeout time.Duration
-	nextHandDelay time.Duration
-	log           []LogEntry
-	lastActivity  time.Time
-	onFinish      func(room *Room)
+	timer           *time.Timer
+	pendingNext     bool
+	actionTimeout   time.Duration
+	nextHandDelay   time.Duration
+	botRand         *mathrand.Rand
+	disconnectGrace time.Duration
+	log             []LogEntry
+	lastActivity    time.Time
+	onFinish        func(room *Room)
 }
 
 type LogEntry struct {
@@ -126,6 +134,7 @@ type Command struct {
 	SessionID string
 	Target    string
 	Action    game.Action
+	Immediate bool // leave was explicit (Sair button), not a dropped connection
 	Resp      chan error
 }
 
@@ -137,22 +146,36 @@ const (
 	CmdKick
 	CmdTick
 	CmdShutdown
+	CmdAddBot
+	CmdRemoveBot
+	CmdExpireLeave
+)
+
+const (
+	// botActionDelay is how long a bot "thinks" before acting.
+	botActionDelay = 1200 * time.Millisecond
+	// disconnectGrace: a waiting-room seat is kept this long after its
+	// connection drops, so a refresh can reclaim it. If nobody rejoins the
+	// seat is removed (player closed the tab).
+	disconnectGrace = 20 * time.Second
 )
 
 func NewRoom(code string, cfg Config, host *Seat, actionTimeout, nextHandDelay time.Duration, onFinish func(*Room)) *Room {
 	r := &Room{
-		code:          code,
-		config:        cfg,
-		status:        StatusWaiting,
-		seats:         []*Seat{host},
-		clients:       map[string]*Client{},
-		hostID:        host.SessionID,
-		commands:      make(chan Command, 64),
-		done:          make(chan struct{}, 1),
-		actionTimeout: actionTimeout,
-		nextHandDelay: nextHandDelay,
-		lastActivity:  time.Now(),
-		onFinish:      onFinish,
+		code:            code,
+		config:          cfg,
+		status:          StatusWaiting,
+		seats:           []*Seat{host},
+		clients:         map[string]*Client{},
+		hostID:          host.SessionID,
+		commands:        make(chan Command, 64),
+		done:            make(chan struct{}, 1),
+		actionTimeout:   actionTimeout,
+		nextHandDelay:   nextHandDelay,
+		botRand:         mathrand.New(mathrand.NewSource(time.Now().UnixNano())),
+		disconnectGrace: disconnectGrace,
+		lastActivity:    time.Now(),
+		onFinish:        onFinish,
 	}
 	r.wg.Add(1)
 	go r.loop()
@@ -283,6 +306,12 @@ func (r *Room) loop() {
 				r.handleKick(cmd)
 			case CmdTick:
 				r.handleTick()
+			case CmdAddBot:
+				r.handleAddBot(cmd)
+			case CmdRemoveBot:
+				r.handleRemoveBot(cmd)
+			case CmdExpireLeave:
+				r.handleExpireLeave(cmd)
 			case CmdShutdown:
 				return
 			}
@@ -327,6 +356,10 @@ func (r *Room) handleJoin(cmd Command) {
 		r.seats = append(r.seats, seat)
 		r.broadcastJSON("log", LogEntry{Text: cmd.Client.Nickname + " entrou na sala", Kind: "info"})
 		r.broadcastJSON("player_joined", map[string]any{"session_id": cmd.Client.SessionID, "nickname": cmd.Client.Nickname})
+	} else if seat.Disconnected {
+		// Reconnect after a refresh: reclaim the same seat.
+		seat.Disconnected = false
+		r.broadcastJSON("player_joined", map[string]any{"session_id": cmd.Client.SessionID, "nickname": cmd.Client.Nickname})
 	}
 	if r.engine != nil {
 		if idx := r.engine.PlayerIndex(cmd.Client.SessionID); idx >= 0 {
@@ -350,26 +383,39 @@ func (r *Room) handleLeave(cmd Command) {
 		}
 	}
 	if r.status == StatusWaiting {
-		for i, s := range r.seats {
-			if s.SessionID == cmd.SessionID {
-				r.seats = append(r.seats[:i], r.seats[i+1:]...)
-				if s.IsHost {
-					r.promoteHostLocked()
+		if cmd.Immediate {
+			// Explicit leave (Sair button): remove the seat right away.
+			for i, s := range r.seats {
+				if s.SessionID == cmd.SessionID {
+					r.seats = append(r.seats[:i], r.seats[i+1:]...)
+					if s.IsHost {
+						r.promoteHostLocked()
+					}
+					r.broadcastJSON("player_left", map[string]any{"session_id": cmd.SessionID})
+					break
 				}
-				r.broadcastJSON("player_left", map[string]any{"session_id": cmd.SessionID})
-				break
 			}
-		}
-		if len(r.seats) == 0 {
-			r.mu.Unlock()
-			if r.onFinish != nil {
-				r.onFinish(r)
+			if len(r.seats) == 0 || !r.hasHumanSeatLocked() {
+				r.mu.Unlock()
+				r.finishRoom()
+				return
 			}
-			select {
-			case r.done <- struct{}{}:
-			default:
+		} else {
+			// Connection dropped (refresh or tab close): keep the seat for a
+			// grace period so a refresh can reclaim it, then expire it.
+			for _, s := range r.seats {
+				if s.SessionID == cmd.SessionID {
+					s.Disconnected = true
+					break
+				}
 			}
-			return
+			sid := cmd.SessionID
+			time.AfterFunc(r.disconnectGrace, func() {
+				select {
+				case r.commands <- Command{Kind: CmdExpireLeave, SessionID: sid}:
+				default:
+				}
+			})
 		}
 	} else if r.engine != nil {
 		if idx := r.engine.PlayerIndex(cmd.SessionID); idx >= 0 {
@@ -381,6 +427,58 @@ func (r *Room) handleLeave(cmd Command) {
 	r.lastActivity = time.Now()
 	cmd.Resp <- nil
 	r.sendGameState()
+}
+
+// handleExpireLeave removes a seat whose connection dropped and whose grace
+// period elapsed without a reconnect.
+func (r *Room) handleExpireLeave(cmd Command) {
+	r.mu.Lock()
+	if r.status != StatusWaiting {
+		r.mu.Unlock()
+		return
+	}
+	removed := false
+	for i, s := range r.seats {
+		if s.SessionID == cmd.SessionID && s.Disconnected {
+			r.seats = append(r.seats[:i], r.seats[i+1:]...)
+			removed = true
+			if s.IsHost {
+				r.promoteHostLocked()
+			}
+			r.broadcastJSON("player_left", map[string]any{"session_id": cmd.SessionID})
+			break
+		}
+	}
+	if removed && (len(r.seats) == 0 || !r.hasHumanSeatLocked()) {
+		r.mu.Unlock()
+		r.finishRoom()
+		return
+	}
+	r.mu.Unlock()
+	r.lastActivity = time.Now()
+	r.sendGameState()
+}
+
+// hasHumanSeatLocked reports whether at least one non-bot seat remains.
+// Callers must hold r.mu.
+func (r *Room) hasHumanSeatLocked() bool {
+	for _, s := range r.seats {
+		if !s.IsBot {
+			return true
+		}
+	}
+	return false
+}
+
+// finishRoom reports the room as finished and stops its goroutine.
+func (r *Room) finishRoom() {
+	if r.onFinish != nil {
+		r.onFinish(r)
+	}
+	select {
+	case r.done <- struct{}{}:
+	default:
+	}
 }
 
 func (r *Room) handleAction(cmd Command) {
@@ -438,14 +536,30 @@ func (r *Room) handleStart(cmd Command) {
 	// Restart (status finished) or first start (waiting): rebuild the engine
 	// so everyone's chips reset (RF1.6).
 	cfgs := make([]game.PlayerConfig, 0, len(r.seats))
+	bbIdx := -1
 	for _, s := range r.seats {
 		if s.Removed {
 			continue
 		}
+		if s.SessionID == cmd.Target {
+			bbIdx = len(cfgs)
+		}
 		cfgs = append(cfgs, game.PlayerConfig{SessionID: s.SessionID, Nickname: s.Nickname, Chips: r.config.InitialChips})
 	}
 	eng := game.NewEngine(cfgs, r.config.SmallBlind, r.config.BigBlind)
-	if err := eng.StartHand(); err != nil {
+	var err error
+	dealerOverride := -1
+	if bbIdx >= 0 && len(cfgs) == 2 {
+		// Heads-up: the chosen player is the big blind, the other is the
+		// dealer and small blind.
+		dealerOverride = 1 - bbIdx
+	}
+	if dealerOverride >= 0 {
+		err = eng.StartHandWithDealer(dealerOverride)
+	} else {
+		err = eng.StartHand()
+	}
+	if err != nil {
 		r.mu.Unlock()
 		cmd.Resp <- err
 		return
@@ -508,6 +622,68 @@ func (r *Room) handleKick(cmd Command) {
 	r.sendGameState()
 }
 
+func (r *Room) handleAddBot(cmd Command) {
+	if cmd.SessionID != r.hostID {
+		cmd.Resp <- ErrNotHost
+		return
+	}
+	r.mu.Lock()
+	if r.status != StatusWaiting {
+		r.mu.Unlock()
+		cmd.Resp <- errors.New("bots can only be added before the game starts")
+		return
+	}
+	if len(r.seats) >= r.config.MaxPlayers {
+		r.mu.Unlock()
+		cmd.Resp <- ErrRoomFull
+		return
+	}
+	n := 1
+	for _, s := range r.seats {
+		if s.IsBot {
+			n++
+		}
+	}
+	r.seats = append(r.seats, &Seat{
+		SessionID: "bot-" + itoa(n),
+		Nickname:  "Bot " + itoa(n),
+		IsBot:     true,
+	})
+	r.mu.Unlock()
+	cmd.Resp <- nil
+	r.broadcastJSON("log", LogEntry{Text: "Bot " + itoa(n) + " entrou na sala", Kind: "info"})
+	r.sendGameState()
+}
+
+func (r *Room) handleRemoveBot(cmd Command) {
+	if cmd.SessionID != r.hostID {
+		cmd.Resp <- ErrNotHost
+		return
+	}
+	r.mu.Lock()
+	if r.status != StatusWaiting {
+		r.mu.Unlock()
+		cmd.Resp <- errors.New("bots can only be removed before the game starts")
+		return
+	}
+	found := false
+	for i, s := range r.seats {
+		if s.SessionID == cmd.Target && s.IsBot {
+			r.seats = append(r.seats[:i], r.seats[i+1:]...)
+			found = true
+			break
+		}
+	}
+	r.mu.Unlock()
+	if !found {
+		cmd.Resp <- errors.New("bot not found")
+		return
+	}
+	cmd.Resp <- nil
+	r.broadcastJSON("player_left", map[string]any{"session_id": cmd.Target})
+	r.sendGameState()
+}
+
 func (r *Room) handleTick() {
 	if r.pendingNext {
 		r.pendingNext = false
@@ -521,11 +697,18 @@ func (r *Room) handleTick() {
 		r.mu.Unlock()
 		return
 	}
-	// Timeout: auto fold/check for the current player (RF3.10).
+	// Timeout: auto fold/check for the current player (RF3.10). Bots play
+	// their own strategy instead of timing out.
 	acted := false
 	handOver := false
 	if idx := r.engine.CurrentIdx(); idx >= 0 {
 		a := r.engine.AutoAction()
+		for _, s := range r.seats {
+			if s.IsBot && s.SessionID == r.engine.Players()[idx].SessionID {
+				a = r.botActionLocked(idx)
+				break
+			}
+		}
 		if err := r.engine.Act(idx, a); err == nil {
 			acted = true
 			handOver = r.engine.IsHandOver()
@@ -554,9 +737,18 @@ func (r *Room) scheduleTimer() {
 	r.mu.RLock()
 	active := r.status == StatusInProgress && r.engine != nil
 	var handOver, pendingNext bool
+	delay := r.actionTimeout
 	if active {
 		handOver = r.engine.IsHandOver()
 		pendingNext = r.pendingNext
+		if idx := r.engine.CurrentIdx(); idx >= 0 {
+			for _, s := range r.seats {
+				if s.IsBot && s.SessionID == r.engine.Players()[idx].SessionID {
+					delay = botActionDelay
+					break
+				}
+			}
+		}
 	}
 	r.mu.RUnlock()
 	if !active {
@@ -570,9 +762,68 @@ func (r *Room) scheduleTimer() {
 		}
 		return
 	}
-	r.timer = time.AfterFunc(r.actionTimeout, func() {
+	r.timer = time.AfterFunc(delay, func() {
 		r.commands <- Command{Kind: CmdTick}
 	})
+}
+
+// botActionLocked decides the next action for a bot seat. Callers must hold
+// r.mu (the engine is mutated by Act).
+func (r *Room) botActionLocked(idx int) game.Action {
+	p := r.engine.Players()[idx]
+	toCall := r.engine.CurrentBet() - p.BetThisRound
+	str := botHandStrength(p.HoleCards)
+	if toCall <= 0 {
+		// Nothing to call: check, or bet big when holding a strong hand.
+		if str >= 3 && r.botRand.Intn(100) < 30 {
+			target := r.engine.CurrentBet() + r.engine.MinRaise()
+			if target < r.engine.BigBlind() {
+				target = r.engine.BigBlind()
+			}
+			if target-p.BetThisRound <= p.Chips {
+				return game.Action{Type: game.ActionRaise, Amount: target}
+			}
+		}
+		return game.Action{Type: game.ActionCheck}
+	}
+	callPct := []int{40, 60, 80, 95}[str]
+	if toCall > p.Chips/2 {
+		callPct -= 20
+	}
+	if r.botRand.Intn(100) < callPct {
+		return game.Action{Type: game.ActionCall}
+	}
+	if p.Chips <= r.engine.BigBlind()*4 && r.botRand.Intn(100) < 60 {
+		return game.Action{Type: game.ActionAllIn}
+	}
+	return game.Action{Type: game.ActionFold}
+}
+
+// botHandStrength is a rough 0..3 rating of a bot's hole cards.
+func botHandStrength(cards []game.Card) int {
+	if len(cards) < 2 {
+		return 0
+	}
+	a, b := cards[0], cards[1]
+	if a.Rank == b.Rank {
+		return 3
+	}
+	if a.Rank >= 14 && b.Rank >= 14 {
+		return 3
+	}
+	if a.Suit == b.Suit && a.Rank >= 13 && b.Rank >= 13 {
+		return 3
+	}
+	if a.Rank >= 12 && b.Rank >= 12 {
+		return 2
+	}
+	if a.Suit == b.Suit && a.Rank >= 10 && b.Rank >= 10 {
+		return 2
+	}
+	if a.Rank >= 13 || b.Rank >= 13 {
+		return 1
+	}
+	return 0
 }
 
 func (r *Room) nextHand() {
@@ -709,12 +960,15 @@ func (r *Room) sendGameState() {
 			continue
 		}
 		seats = append(seats, map[string]any{
-			"session_id": s.SessionID,
-			"nickname":   s.Nickname,
-			"is_host":    s.IsHost,
+			"session_id":   s.SessionID,
+			"nickname":     s.Nickname,
+			"is_host":      s.IsHost,
+			"is_bot":       s.IsBot,
+			"disconnected": s.Disconnected,
 		})
 	}
 	log := append([]LogEntry{}, r.log...)
+	champion := r.champion
 	r.mu.RUnlock()
 
 	var remaining int
@@ -729,6 +983,15 @@ func (r *Room) sendGameState() {
 			"seats":     seats,
 			"log":       log,
 			"remaining": remaining,
+		}
+		if champion != nil {
+			msg["champion"] = map[string]any{
+				"winner_session": champion.WinnerSession,
+				"winner_name":    champion.WinnerName,
+				"final_chips":    champion.FinalChips,
+				"total_pot":      champion.TotalPot,
+				"player_count":   champion.PlayerCount,
+			}
 		}
 		if r.engine != nil {
 			ps := r.engine.PublicState()

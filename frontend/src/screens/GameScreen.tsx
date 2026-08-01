@@ -1,13 +1,13 @@
-import { useEffect, useReducer, useRef } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
 import { ActionPanel } from "../components/ActionPanel";
-import { HistoryLog } from "../components/HistoryLog";
+import { PlayersList } from "../components/PlayersList";
 import { Table2D } from "../components/Table2D";
 import { GameClient } from "../lib/ws";
 import type { ConnStatus } from "../lib/ws";
+import { clearRoom } from "../lib/session";
 import type { Session } from "../lib/session";
 import type {
   GameStateMsg,
-  LogEntry,
   MatchOverMsg,
   ServerMsg,
   ShowdownMsg,
@@ -19,7 +19,6 @@ interface GameState {
   state: GameStateMsg | null;
   showdown: ShowdownMsg["payload"] | null;
   matchOver: MatchOverMsg["payload"] | null;
-  log: LogEntry[];
   conn: ConnStatus;
   kicked: boolean;
   lastError: string | null;
@@ -29,7 +28,6 @@ const initial: GameState = {
   state: null,
   showdown: null,
   matchOver: null,
-  log: [],
   conn: "connecting",
   kicked: false,
   lastError: null,
@@ -39,7 +37,6 @@ type Action =
   | { type: "state"; msg: GameStateMsg }
   | { type: "showdown"; payload: ShowdownMsg["payload"] }
   | { type: "match"; payload: MatchOverMsg["payload"] }
-  | { type: "log"; entry: LogEntry }
   | { type: "conn"; status: ConnStatus }
   | { type: "kicked" }
   | { type: "error"; message: string }
@@ -51,7 +48,6 @@ function reducer(g: GameState, a: Action): GameState {
       return {
         ...g,
         state: a.msg,
-        log: a.msg.log.length ? a.msg.log : g.log,
         showdown: a.msg.state.hand_over ? g.showdown : null,
         matchOver: a.msg.room.status === "finished" ? g.matchOver : null,
       };
@@ -59,8 +55,6 @@ function reducer(g: GameState, a: Action): GameState {
       return { ...g, showdown: a.payload };
     case "match":
       return { ...g, matchOver: a.payload, showdown: null };
-    case "log":
-      return { ...g, log: [...g.log, a.entry].slice(-60) };
     case "conn":
       return { ...g, conn: a.status };
     case "kicked":
@@ -79,6 +73,7 @@ export function GameScreen({ session, roomCode, onLeave }: {
 }) {
   const [game, dispatch] = useReducer(reducer, initial);
   const clientRef = useRef<GameClient | null>(null);
+  const [bbSession, setBbSession] = useState<string | null>(null);
 
   useEffect(() => {
     const client = new GameClient(session.session_id, session.nickname, roomCode);
@@ -93,6 +88,18 @@ export function GameScreen({ session, roomCode, onLeave }: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomCode]);
 
+  // Heads-up: default the blind pick to the player who isn't the host.
+  useEffect(() => {
+    const seats = game.state?.seats ?? [];
+    if (
+      seats.length === 2 &&
+      (!bbSession || !seats.some((s) => s.session_id === bbSession))
+    ) {
+      const other = seats.find((s) => s.session_id !== session.session_id);
+      setBbSession(other?.session_id ?? seats[0].session_id);
+    }
+  }, [game.state?.seats, bbSession, session.session_id]);
+
   const handleMessage = (msg: ServerMsg) => {
     switch (msg.type) {
       case "game_state":
@@ -103,9 +110,6 @@ export function GameScreen({ session, roomCode, onLeave }: {
         break;
       case "match_over":
         dispatch({ type: "match", payload: msg.payload });
-        break;
-      case "log":
-        dispatch({ type: "log", entry: msg.payload });
         break;
       case "kicked":
         dispatch({ type: "kicked" });
@@ -126,15 +130,36 @@ export function GameScreen({ session, roomCode, onLeave }: {
     clientRef.current?.send({ type, ...extra });
   };
 
+  // Explicit leave: tells the server to free the seat and clears the saved
+  // room so a refresh won't rejoin it.
+  const leave = () => {
+    clientRef.current?.send({ type: "leave" });
+    clientRef.current?.close();
+    clearRoom();
+    onLeave();
+  };
+
   const isHost = game.state?.room.host_id === session.session_id;
   const state = game.state?.state;
   const yourIdx = game.state?.your_idx ?? -1;
   const waiting = game.state?.room.status === "waiting";
-  const canStart = waiting && isHost && (game.state?.seats.length ?? 0) >= 2;
+  const seats = game.state?.seats ?? [];
+  const canStart = waiting && isHost && seats.length >= 2;
   const connected = game.conn === "open";
+  // After a refresh on a finished room the match payload comes from the
+  // game_state champion instead of the match_over event.
+  const matchOver = game.matchOver ?? game.state?.champion ?? null;
 
   const copyCode = () => {
     navigator.clipboard?.writeText(roomCode).catch(() => {});
+  };
+
+  const startGame = () => {
+    if (seats.length === 2) {
+      send("start", { big_blind_session: bbSession ?? seats[1].session_id });
+    } else {
+      send("start");
+    }
   };
 
   if (game.kicked) {
@@ -142,7 +167,7 @@ export function GameScreen({ session, roomCode, onLeave }: {
       <div className="entry">
         <div className="entry-card">
           <h2>Foste expulso da sala</h2>
-          <button className="btn primary big" onClick={onLeave}>Voltar ao início</button>
+          <button className="btn primary big" onClick={leave}>Voltar ao início</button>
         </div>
       </div>
     );
@@ -158,7 +183,7 @@ export function GameScreen({ session, roomCode, onLeave }: {
             {roomCode} ⧉
           </button>
           <span className={`status-dot ${game.state?.room.status ?? "waiting"}`} />
-          {waiting && <span className="waiting-label">A aguardar jogadores… ({game.state?.seats.length ?? 0}/{game.state?.room.max_players ?? 9})</span>}
+          {waiting && <span className="waiting-label">A aguardar jogadores… ({seats.length}/{game.state?.room.max_players ?? 9})</span>}
         </div>
         <div className="conn">
           {connected ? (
@@ -166,7 +191,7 @@ export function GameScreen({ session, roomCode, onLeave }: {
           ) : (
             <span className="conn-bad">● {game.conn === "reconnecting" ? "A reconectar…" : "A ligar…"}</span>
           )}
-          <button className="btn subtle" onClick={onLeave}>Sair</button>
+          <button className="btn subtle" onClick={leave}>Sair</button>
         </div>
       </header>
 
@@ -180,20 +205,44 @@ export function GameScreen({ session, roomCode, onLeave }: {
                 Estás na sala <b>{roomCode}</b>. Partilha o código com os teus amigos!
               </p>
               <div className="lobby-seats">
-                {game.state?.seats.map((s) => (
-                  <div key={s.session_id} className="lobby-seat">
+                {seats.map((s) => (
+                  <div key={s.session_id} className={`lobby-seat ${s.disconnected ? "offline" : ""}`}>
                     <span className="avatar">{s.nickname.slice(0, 1).toUpperCase()}</span>
-                    {s.nickname} {s.is_host ? "(host)" : ""}
-                    {isHost && !s.is_host && (
+                    {s.nickname} {s.is_host ? "(host)" : ""} {s.is_bot ? "(bot)" : ""}
+                    {s.disconnected ? " (sem ligação)" : ""}
+                    {isHost && !s.is_host && !s.is_bot && (
                       <button className="btn tiny danger" onClick={() => send("kick", { session_id: s.session_id })}>
                         Expulsar
+                      </button>
+                    )}
+                    {isHost && s.is_bot && (
+                      <button className="btn tiny danger" onClick={() => send("remove_bot", { session_id: s.session_id })}>
+                        Remover
                       </button>
                     )}
                   </div>
                 ))}
               </div>
+
+              {isHost && seats.length < (game.state?.room.max_players ?? 9) && (
+                <button className="btn subtle" onClick={() => send("add_bot")}>
+                  + Adicionar bot
+                </button>
+              )}
+
+              {isHost && seats.length === 2 && (
+                <label className="field blind-pick">
+                  <span>Quem fica de Big Blind? (o outro fica de Small Blind)</span>
+                  <select value={bbSession ?? ""} onChange={(e) => setBbSession(e.target.value)}>
+                    {seats.map((s) => (
+                      <option key={s.session_id} value={s.session_id}>{s.nickname}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
+
               {isHost ? (
-                <button className="btn primary big" disabled={!canStart} onClick={() => send("start")}>
+                <button className="btn primary big" disabled={!canStart} onClick={startGame}>
                   {canStart ? "Começar partida" : "Espera por mais jogadores (mín. 2)"}
                 </button>
               ) : (
@@ -217,8 +266,8 @@ export function GameScreen({ session, roomCode, onLeave }: {
         </div>
 
         <aside className="sidebar">
-          <h3>Histórico</h3>
-          <HistoryLog log={game.log} />
+          <h3>Jogadores</h3>
+          <PlayersList seats={seats} state={state ?? null} />
         </aside>
       </main>
 
@@ -253,20 +302,20 @@ export function GameScreen({ session, roomCode, onLeave }: {
         </div>
       )}
 
-      {game.matchOver && (
+      {matchOver && (
         <div className="modal">
           <div className="modal-card">
-            <h2>🏆 {game.matchOver.winner_name} ganhou a partida!</h2>
+            <h2>🏆 {matchOver.winner_name} ganhou a partida!</h2>
             <p>
-              Fichas finais: {game.matchOver.final_chips.toLocaleString("pt-PT")} ·
-              {game.matchOver.player_count} jogadores
+              Fichas finais: {matchOver.final_chips.toLocaleString("pt-PT")} ·
+              {matchOver.player_count} jogadores
             </p>
             {isHost && (
-              <button className="btn primary big" onClick={() => send("start")}>
+              <button className="btn primary big" onClick={startGame}>
                 Jogar outra partida (fichas repostas)
               </button>
             )}
-            <button className="btn subtle" onClick={onLeave}>Sair da sala</button>
+            <button className="btn subtle" onClick={leave}>Sair da sala</button>
           </div>
         </div>
       )}
