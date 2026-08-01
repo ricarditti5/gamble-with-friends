@@ -43,7 +43,7 @@ Variáveis de ambiente (opcionais):
 | Variável | Descrição | Default |
 |---|---|---|
 | `PORT` | porta HTTP/WS | `8080` |
-| `CORS_ORIGINS` | origens permitidas (`*` ou lista separada por vírgulas; com lista explícita as credenciais são permitidas) | `*` |
+| `CORS_ORIGINS` | quem pode aceder à API a partir de um browser — **vazio**: só same-origin; lista de domínios (vírgulas): só esses; `*`: qualquer origem (abre a API a outros sites) | vazio |
 | `DATABASE_URL` | PostgreSQL (histórico de partidas) | desligado |
 | `AUTO_MIGRATE` | aplica as migrations no arranque | `false` |
 | `GWF_LOG_FORMAT` | formato dos logs estruturados: `text` ou `json` | `text` |
@@ -62,12 +62,28 @@ Variáveis de ambiente (opcionais):
 
 ## Segurança
 
+- **CORS restrito por defeito:** sem `CORS_ORIGINS`, só o próprio host do
+  backend acede via browser. Com frontend noutro domínio (ex: Vercel), define
+  `CORS_ORIGINS=https://o-teu-frontend.com` — qualquer browser a abrir *o teu*
+  site funciona, mas sites de terceiros não conseguem usar a API. `*` é uma
+  escolha explícita de acesso aberto.
+- **Rate limiting por IP:** 120 pedidos/min na API e 10/min na criação de
+  salas (429 quando excede). CORS não bloqueia pedidos diretos (curl/bots) —
+  é o rate limiter + validação que trazem esse abuso.
+- **WebSocket:** origens não autorizadas são recusadas no upgrade (CSWSH);
+  clientes sem header `Origin` (bots) são aceites, e same-origin também.
 - **CSRF:** token assinado (HMAC-SHA256) emitido por `GET /api/csrf` e enviado
-  no header `X-CSRF-Token` em métodos que alteram estado. Sem cookies — funciona
-  entre sites (Vercel → API) mesmo com third-party cookies bloqueados. Define
+  no header `X-CSRF-Token` em métodos que alteram estado. Sem cookies —
+  funciona entre sites mesmo com third-party cookies bloqueados. Define
   `GWF_CSRF_SECRET` (hex) para tokens estáveis entre reinícios.
-- **CORS:** com `CORS_ORIGINS` explícito (ex: `https://frontend.meusite.com`) o
-  backend permite credenciais e o preflight aceita `X-CSRF-Token`.
+- **MITM:** redirect http→https quando detetado `X-Forwarded-Proto: http`
+  (atrás de proxy TLS) + HSTS. Usa sempre `wss://` no `VITE_WS_URL`.
+- **Injeção:** headers de segurança em todas as respostas
+  (`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+  `Referrer-Policy: no-referrer`, `Permissions-Policy`), Content-Security-Policy
+  injectada no build de produção do frontend (scripts só locais, sem iframes),
+  e saneamento de caracteres de controlo em nickname/nome de sala. O React
+  escapa a saída (anti-XSS) e as queries à BD são parametrizadas (anti-SQLi).
 
 ## Migrations (PostgreSQL)
 
@@ -114,12 +130,14 @@ npm run build
 | `VITE_API_URL` | URL do backend para os pedidos HTTP (ex: `https://api.meusite.com`) | vazio (usa o mesmo host) |
 | `VITE_WS_URL` | URL do backend para o WebSocket (ex: `wss://api.meusite.com`) | vazio (usa o mesmo host) |
 
-Se o frontend e o backend estiverem em **domínios diferentes**, o backend
-também precisa de:
+Se o frontend e o backend estiverem em **domínios diferentes** (ex: Vercel +
+Render), o backend precisa do domínio do frontend para o CORS:
 
 ```bash
-CORS_ORIGINS=https://frontend.meusite.com   # domínio do frontend, não "*"
+CORS_ORIGINS=https://frontend.meusite.com
 ```
+
+Qualquer browser a abrir o teu site funciona; outros sites ficam bloqueados.
 
 ## Testes
 

@@ -29,10 +29,10 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
+	// CORS: vazio = apenas same-origin (navegador só acede à API a partir do
+	// próprio host). Em produção com frontend noutro domínio, define
+	// CORS_ORIGINS=https://dominio-do-frontend. "*" abre a qualquer origem.
 	origins := os.Getenv("CORS_ORIGINS")
-	if origins == "" {
-		origins = "*"
-	}
 
 	// Optional persistence: set DATABASE_URL to enable history (RNF3.1).
 	// Migrations are applied manually from migrations/*.sql (up/down pairs),

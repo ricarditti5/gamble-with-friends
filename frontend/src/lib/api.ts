@@ -10,7 +10,7 @@ let csrfToken: string | null = null;
 
 async function ensureCsrf(): Promise<string> {
   if (csrfToken) return csrfToken;
-  const res = await fetch(`${API}/api/csrf`, { credentials: "include" });
+  const res = await fetch(`${API}/api/csrf`);
   const body = await res.json().catch(() => ({}));
   csrfToken = (body as { token?: string }).token ?? "";
   return csrfToken;
@@ -24,7 +24,6 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   }
   const res = await fetch(`${API}${path}`, {
     headers,
-    credentials: "include",
     ...init,
   });
   const body = await res.json().catch(() => ({}));

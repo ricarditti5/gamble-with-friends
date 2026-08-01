@@ -25,37 +25,45 @@ import (
 )
 
 type Server struct {
-	Manager *room.Manager
-	app     *fiber.App
-	tracer  trace.Tracer
-	csrf    *csrfTokens
+	Manager      *room.Manager
+	app          *fiber.App
+	tracer       trace.Tracer
+	csrf         *csrfTokens
+	allowedOrigs []string // origens permitidas; ["*"] = qualquer; vazia = só same-origin
+	openAccess   bool
 }
 
 func New(manager *room.Manager, allowedOrigins string) *Server {
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
 	app.Use(logger.New())
-	corsCfg := cors.Config{
-		AllowOrigins: allowedOrigins,
-		AllowMethods: "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-		AllowHeaders: "Content-Type, X-CSRF-Token",
+
+	s := &Server{
+		Manager:      manager,
+		app:          app,
+		tracer:       otel.GetTracerProvider().Tracer(appotel.ServiceName),
+		openAccess:   allowedOrigins == "*",
+		allowedOrigs: parseOrigins(allowedOrigins),
 	}
-	// Wildcard + credentials is invalid; when an explicit origin list is
-	// configured, echo credentials for cross-site use.
-	if allowedOrigins != "*" {
-		corsCfg.AllowCredentials = true
+
+	// CORS controla apenas o acesso por navegador. Vazio = sem headers CORS
+	// (só o próprio host acede). Lista = só esses domínios. "*" = qualquer
+	// origem (escolha explícita). Ataques diretos (curl/bots) não passam por
+	// CORS — esses são travados pelo rate limiter e pela validação de dados.
+	if allowedOrigins != "" {
+		app.Use(cors.New(cors.Config{
+			AllowOrigins: allowedOrigins,
+			AllowMethods: "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+			AllowHeaders: "Content-Type, X-CSRF-Token",
+		}))
 	}
-	app.Use(cors.New(corsCfg))
+	app.Use(securityHeaders())
+	app.Use(forceHTTPS())
 
 	tokens, err := newCsrfTokens()
 	if err != nil {
 		slog.Error("csrf setup failed", "error", err)
 	}
-	s := &Server{
-		Manager: manager,
-		app:     app,
-		tracer:  otel.GetTracerProvider().Tracer(appotel.ServiceName),
-		csrf:    tokens,
-	}
+	s.csrf = tokens
 	s.routes()
 	return s
 }
@@ -77,6 +85,10 @@ func (s *Server) routes() {
 
 	api := s.app.Group("/api")
 	api.Use(s.otelMiddleware(), csrfMiddleware(s.csrf))
+	// Rate limiting por IP: travam-se floods/bots. Limites baixos nas
+	// operações que criam estado (sala nova) e normais no resto.
+	api.Use(rateLimiter(120, time.Minute))
+	api.Post("/rooms", rateLimiter(10, time.Minute), s.handleCreateRoom)
 	api.Get("/csrf", func(c *fiber.Ctx) error {
 		token, err := s.csrf.issue()
 		if err != nil {
@@ -85,11 +97,11 @@ func (s *Server) routes() {
 		}
 		return c.JSON(fiber.Map{"token": token})
 	})
-	api.Post("/rooms", s.handleCreateRoom)
 	api.Get("/rooms/:code", s.handleGetRoom)
 	api.Get("/rooms/:code/config", s.handleGetRoomConfig)
 
-	s.app.Get("/ws", websocket.New(s.handleWS, websocket.Config{Subprotocols: []string{"chat"}}))
+	s.app.Get("/ws", wsOriginGuard(s.allowedOrigs, s.openAccess),
+		websocket.New(s.handleWS, websocket.Config{Subprotocols: []string{"chat"}}))
 }
 
 // otelMiddleware starts a server span per HTTP request and records the result.
@@ -136,7 +148,7 @@ func (s *Server) handleCreateRoom(c *fiber.Ctx) error {
 		slog.Warn("create room: invalid body", "error", err)
 		return c.Status(400).JSON(fiber.Map{"error": "invalid body"})
 	}
-	req.Nickname = strings.TrimSpace(req.Nickname)
+	req.Nickname = sanitizeText(strings.TrimSpace(req.Nickname))
 	if len(req.Nickname) < 1 || len(req.Nickname) > 20 {
 		slog.Warn("create room: invalid nickname", "nickname", req.Nickname)
 		return c.Status(400).JSON(fiber.Map{"error": "nickname must be 1-20 characters"})
@@ -146,7 +158,7 @@ func (s *Server) handleCreateRoom(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid session_id"})
 	}
 	cfg := room.Config{
-		Name:         strings.TrimSpace(req.Name),
+		Name:         sanitizeText(strings.TrimSpace(req.Name)),
 		MaxPlayers:   req.MaxPlayers,
 		InitialChips: req.InitialChips,
 		SmallBlind:   req.SmallBlind,
@@ -251,7 +263,7 @@ func (s *Server) handleWS(conn *websocket.Conn) {
 		}
 		switch msg.Type {
 		case "join":
-			msg.Nickname = strings.TrimSpace(msg.Nickname)
+			msg.Nickname = sanitizeText(strings.TrimSpace(msg.Nickname))
 			if _, err := uuid.FromString(msg.SessionID); err != nil {
 				slog.Warn("ws join: invalid session_id", "room", roomCode, "session_id", msg.SessionID)
 				conn.WriteJSON(fiber.Map{"type": "error", "payload": "invalid session_id"})
