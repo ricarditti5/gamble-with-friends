@@ -652,7 +652,6 @@ func (e *Engine) endHand(showdown bool) {
 	e.handOver = true
 	pots := e.computeSidePots()
 	res := &HandResult{Showdown: showdown, Pots: pots, Community: append([]Card{}, e.community...)}
-
 	bestHand := map[int]HandValue{}
 	if showdown {
 		for i, p := range e.players {
@@ -690,7 +689,9 @@ func (e *Engine) endHand(showdown bool) {
 			}
 			e.players[w].Chips += amt
 			if winnersByPlayer[w] == nil {
-				winnersByPlayer[w] = &PotWinner{PlayerIdx: w, Nickname: e.players[w].Nickname}
+				// Cards come as an empty array (never null) so clients don't
+				// crash rendering the showdown modal on fold wins.
+				winnersByPlayer[w] = &PotWinner{PlayerIdx: w, Nickname: e.players[w].Nickname, Cards: []Card{}}
 				order = append(order, w)
 			}
 			winnersByPlayer[w].Amount += amt

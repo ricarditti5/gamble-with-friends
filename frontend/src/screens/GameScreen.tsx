@@ -285,7 +285,7 @@ export function GameScreen({ session, roomCode, onLeave }: {
             {game.showdown.winners.map((w) => (
               <div key={w.player_idx} className="winner-row">
                 <div className="winner-cards">
-                  {w.cards.map((c, i) => (
+                  {(w.cards ?? []).map((c, i) => (
                     <CardView key={i} card={c} small />
                   ))}
                 </div>
