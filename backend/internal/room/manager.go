@@ -11,7 +11,6 @@ type Manager struct {
 	mu    sync.RWMutex
 	rooms map[string]*Room
 
-	ActionTimeout time.Duration
 	NextHandDelay time.Duration
 	IdleTTL       time.Duration
 	FinishedTTL   time.Duration
@@ -21,7 +20,6 @@ type Manager struct {
 func NewManager() *Manager {
 	return &Manager{
 		rooms:         map[string]*Room{},
-		ActionTimeout: 25 * time.Second,
 		NextHandDelay: 4 * time.Second,
 		IdleTTL:       30 * time.Minute,
 		FinishedTTL:   1 * time.Hour,
@@ -47,7 +45,7 @@ func (m *Manager) CreateRoom(cfg Config, host *Seat) (*Room, error) {
 			return nil, err
 		}
 	}
-	r := NewRoom(code, cfg, host, m.ActionTimeout, m.NextHandDelay, func(r *Room) {
+	r := NewRoom(code, cfg, host, m.NextHandDelay, func(r *Room) {
 		if m.OnRoomFinish != nil {
 			m.OnRoomFinish(r)
 		}

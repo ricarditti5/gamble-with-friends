@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import type { PublicState } from "../types";
 
-// The server sends the remaining seconds with each state; we tick locally so
-// the timer bar is smooth and buttons disable at 0 (server auto-acts).
+// No action timer: the game waits for the player to act. Bots and
+// disconnected players are handled server-side.
 export function ActionPanel({ state, yourIdx, onAction, disabled }: {
   state: PublicState;
   yourIdx: number;
@@ -11,7 +11,6 @@ export function ActionPanel({ state, yourIdx, onAction, disabled }: {
 }) {
   const me = state.players[yourIdx];
   const toCall = me ? state.current_bet - me.bet_this_round : 0;
-  const [remaining, setRemaining] = useState(30);
   const [raiseTarget, setRaiseTarget] = useState(0);
 
   const canAct = !disabled && me?.status === 0 && state.current_idx === yourIdx && !state.hand_over;
@@ -29,39 +28,30 @@ export function ActionPanel({ state, yourIdx, onAction, disabled }: {
     if (me) setRaiseTarget(Math.min(Math.max(minRaiseTarget, state.current_bet + 1), maxRaiseTarget));
   }, [minRaiseTarget, maxRaiseTarget, me, state.current_bet]);
 
-  useEffect(() => {
-    const iv = setInterval(() => setRemaining((r) => Math.max(0, r - 1)), 1000);
-    return () => clearInterval(iv);
-  }, [state.current_idx, state.phase]);
-
   if (!me) return null;
-  const timeUp = remaining <= 0;
 
   const betAmount = Math.max(0, raiseTarget - me.bet_this_round);
 
   return (
     <div className="action-panel">
-      <div className="timer-bar">
-        <div className="timer-fill" style={{ width: `${Math.min(100, (remaining / 30) * 100)}%` }} />
-      </div>
       <div className="action-row">
-        <button className="btn danger" disabled={!canAct || timeUp} onClick={() => onAction("fold")}>
+        <button className="btn danger" disabled={!canAct} onClick={() => onAction("fold")}>
           Fold
         </button>
         {toCall <= 0 ? (
-          <button className="btn neutral" disabled={!canAct || timeUp} onClick={() => onAction("check")}>
+          <button className="btn neutral" disabled={!canAct} onClick={() => onAction("check")}>
             Check
           </button>
         ) : (
           <button
             className="btn primary"
-            disabled={!canAct || timeUp}
+            disabled={!canAct}
             onClick={() => onAction("call")}
           >
             Call {Math.min(toCall, me.chips)}
           </button>
         )}
-        <button className="btn warn" disabled={!canAct || timeUp} onClick={() => onAction("all_in")}>
+        <button className="btn warn" disabled={!canAct} onClick={() => onAction("all_in")}>
           All-in {me.chips}
         </button>
         <div className="raise-box">
@@ -71,12 +61,12 @@ export function ActionPanel({ state, yourIdx, onAction, disabled }: {
             max={maxRaiseTarget}
             step={state.big_blind}
             value={raiseTarget}
-            disabled={!canAct || timeUp}
+            disabled={!canAct}
             onChange={(e) => setRaiseTarget(Number(e.target.value))}
           />
           <button
             className="btn primary"
-            disabled={!canAct || timeUp}
+            disabled={!canAct}
             onClick={() => onAction("raise", raiseTarget)}
           >
             Raise {betAmount}
@@ -84,7 +74,6 @@ export function ActionPanel({ state, yourIdx, onAction, disabled }: {
         </div>
       </div>
       {!canAct && state.phase === 4 && <div className="action-note">Mão terminada — nova mão em breve…</div>}
-      {canAct && timeUp && <div className="action-note">Tempo esgotado — o servidor vai agir por ti…</div>}
     </div>
   );
 }

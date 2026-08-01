@@ -114,7 +114,6 @@ type Room struct {
 
 	timer           *time.Timer
 	pendingNext     bool
-	actionTimeout   time.Duration
 	nextHandDelay   time.Duration
 	botRand         *mathrand.Rand
 	disconnectGrace time.Duration
@@ -154,13 +153,17 @@ const (
 const (
 	// botActionDelay is how long a bot "thinks" before acting.
 	botActionDelay = 1200 * time.Millisecond
+	// disconnectedActionDelay: when it is a disconnected human's turn, the
+	// game waits this long for them to reconnect before folding them. There
+	// is no action timer for connected humans: the game waits for them.
+	disconnectedActionDelay = 15 * time.Second
 	// disconnectGrace: a waiting-room seat is kept this long after its
 	// connection drops, so a refresh can reclaim it. If nobody rejoins the
 	// seat is removed (player closed the tab).
 	disconnectGrace = 20 * time.Second
 )
 
-func NewRoom(code string, cfg Config, host *Seat, actionTimeout, nextHandDelay time.Duration, onFinish func(*Room)) *Room {
+func NewRoom(code string, cfg Config, host *Seat, nextHandDelay time.Duration, onFinish func(*Room)) *Room {
 	r := &Room{
 		code:            code,
 		config:          cfg,
@@ -170,7 +173,6 @@ func NewRoom(code string, cfg Config, host *Seat, actionTimeout, nextHandDelay t
 		hostID:          host.SessionID,
 		commands:        make(chan Command, 64),
 		done:            make(chan struct{}, 1),
-		actionTimeout:   actionTimeout,
 		nextHandDelay:   nextHandDelay,
 		botRand:         mathrand.New(mathrand.NewSource(time.Now().UnixNano())),
 		disconnectGrace: disconnectGrace,
@@ -697,38 +699,49 @@ func (r *Room) handleTick() {
 		r.mu.Unlock()
 		return
 	}
-	// Timeout: auto fold/check for the current player (RF3.10). Bots play
-	// their own strategy instead of timing out.
-	acted := false
+	idx := r.engine.CurrentIdx()
+	if idx < 0 {
+		r.mu.Unlock()
+		return
+	}
+	p := r.engine.Players()[idx]
+	isBot := false
+	for _, s := range r.seats {
+		if s.IsBot && s.SessionID == p.SessionID {
+			isBot = true
+			break
+		}
+	}
+	// There is no action timer for connected humans (the game waits for
+	// them). A tick only arrives for a bot "thinking" or for a disconnected
+	// human whose turn would otherwise block the game.
+	if !isBot && !p.Disconnected {
+		r.mu.Unlock()
+		return
+	}
+	a := r.engine.AutoAction()
+	if isBot {
+		a = r.botActionLocked(idx)
+	}
 	handOver := false
-	if idx := r.engine.CurrentIdx(); idx >= 0 {
-		a := r.engine.AutoAction()
-		for _, s := range r.seats {
-			if s.IsBot && s.SessionID == r.engine.Players()[idx].SessionID {
-				a = r.botActionLocked(idx)
-				break
-			}
+	if err := r.engine.Act(idx, a); err == nil {
+		handOver = r.engine.IsHandOver()
+		if handOver {
+			r.pendingNext = true
 		}
-		if err := r.engine.Act(idx, a); err == nil {
-			acted = true
-			handOver = r.engine.IsHandOver()
-			if handOver {
-				r.pendingNext = true
-			}
-			r.logActionLocked(r.engine.Players()[idx].SessionID, a)
-		}
+		r.logActionLocked(p.SessionID, a)
 	}
 	r.mu.Unlock()
-	if acted {
-		if handOver {
-			r.broadcastJSON("showdown", r.engine.Result())
-		}
-		r.sendGameState()
+	if handOver {
+		r.broadcastJSON("showdown", r.engine.Result())
 	}
+	r.sendGameState()
 }
 
-// scheduleTimer arms the action timer when a hand is waiting for input,
-// or the next-hand delay when a hand just ended.
+// scheduleTimer arms the bot "thinking" timer or the next-hand delay when a
+// hand just ended. Connected humans have no action timer: the game waits for
+// them indefinitely. The only human timer is a short grace for a disconnected
+// player whose turn would otherwise block the game.
 func (r *Room) scheduleTimer() {
 	if r.timer != nil {
 		r.timer.Stop()
@@ -737,16 +750,26 @@ func (r *Room) scheduleTimer() {
 	r.mu.RLock()
 	active := r.status == StatusInProgress && r.engine != nil
 	var handOver, pendingNext bool
-	delay := r.actionTimeout
+	delay := time.Duration(0)
 	if active {
 		handOver = r.engine.IsHandOver()
 		pendingNext = r.pendingNext
 		if idx := r.engine.CurrentIdx(); idx >= 0 {
+			p := r.engine.Players()[idx]
+			isBot := false
 			for _, s := range r.seats {
-				if s.IsBot && s.SessionID == r.engine.Players()[idx].SessionID {
-					delay = botActionDelay
+				if s.IsBot && s.SessionID == p.SessionID {
+					isBot = true
 					break
 				}
+			}
+			switch {
+			case isBot:
+				delay = botActionDelay
+			case p.Disconnected:
+				delay = disconnectedActionDelay
+			default:
+				// Connected human: wait for them to act.
 			}
 		}
 	}
@@ -760,6 +783,9 @@ func (r *Room) scheduleTimer() {
 				r.commands <- Command{Kind: CmdTick}
 			})
 		}
+		return
+	}
+	if delay <= 0 {
 		return
 	}
 	r.timer = time.AfterFunc(delay, func() {
@@ -969,12 +995,29 @@ func (r *Room) sendGameState() {
 	}
 	log := append([]LogEntry{}, r.log...)
 	champion := r.champion
-	r.mu.RUnlock()
-
 	var remaining int
 	if r.engine != nil && !r.engine.IsHandOver() && r.status == StatusInProgress {
-		remaining = int(r.actionTimeout.Seconds())
+		if idx := r.engine.CurrentIdx(); idx >= 0 {
+			p := r.engine.Players()[idx]
+			isBot := false
+			for _, s := range r.seats {
+				if s.IsBot && s.SessionID == p.SessionID {
+					isBot = true
+					break
+				}
+			}
+			switch {
+			case isBot:
+				remaining = int(botActionDelay.Seconds())
+			case p.Disconnected:
+				remaining = int(disconnectedActionDelay.Seconds())
+			default:
+				// Connected human: no time limit.
+				remaining = 0
+			}
+		}
 	}
+	r.mu.RUnlock()
 
 	for _, c := range r.clients {
 		msg := map[string]any{

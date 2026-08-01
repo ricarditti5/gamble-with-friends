@@ -11,7 +11,7 @@ func newTestRoom(t *testing.T) *Room {
 	t.Helper()
 	cfg := Config{Name: "test", MaxPlayers: 4, InitialChips: 1000, SmallBlind: 5, BigBlind: 10}
 	host := &Seat{SessionID: "host-uuid", Nickname: "host", IsHost: true}
-	r := NewRoom("ABC123", cfg, host, 2*time.Second, 500*time.Millisecond, nil)
+	r := NewRoom("ABC123", cfg, host, 500*time.Millisecond, nil)
 	t.Cleanup(r.Shutdown)
 	return r
 }
@@ -63,12 +63,25 @@ func TestRoomJoinStartAndPlay(t *testing.T) {
 		t.Fatalf("status = %v, want in_progress", r.Status())
 	}
 
-	// The engine auto-advances; let the timer do auto-actions until a hand
-	// finishes (test room uses a 2s action timeout).
+	// No action timer: the game waits for human input, so drive the hand
+	// manually. Heads-up: the dealer (host, idx 0) acts first preflop.
+	waitFor(t, func() bool { return r.engine.CurrentIdx() == 0 }, "host's turn preflop")
+	mustCommand(t, r, Command{Kind: CmdAction, SessionID: "host-uuid", Action: game.Action{Type: game.ActionRaise, Amount: 30}})
+	waitFor(t, func() bool { return r.engine.CurrentIdx() == 1 }, "p2's turn preflop")
+	mustCommand(t, r, Command{Kind: CmdAction, SessionID: "p2-uuid", Action: game.Action{Type: game.ActionCall}})
+
+	// The flop is dealt automatically when the betting round completes.
+	// Postflop the dealer (host, idx 0) acts last, so p2 goes first.
+	waitFor(t, func() bool { return r.engine.Phase() == game.PhaseFlop }, "flop dealt automatically")
+	waitFor(t, func() bool { return r.engine.CurrentIdx() == 1 }, "p2's turn on the flop")
+	mustCommand(t, r, Command{Kind: CmdAction, SessionID: "p2-uuid", Action: game.Action{Type: game.ActionCheck}})
+	waitFor(t, func() bool { return r.engine.CurrentIdx() == 0 }, "host's turn on the flop")
+	mustCommand(t, r, Command{Kind: CmdAction, SessionID: "host-uuid", Action: game.Action{Type: game.ActionFold}})
+
 	waitFor(t, func() bool {
 		_, handOver := r.EngineStatus()
 		return handOver
-	}, "hand to finish via auto-actions")
+	}, "hand to finish")
 
 	// After the next-hand delay the room should have started a new hand.
 	waitFor(t, func() bool {
@@ -121,7 +134,7 @@ func TestRoomKickInWaiting(t *testing.T) {
 
 func TestRoomFullRejected(t *testing.T) {
 	cfg := Config{Name: "x", MaxPlayers: 2, InitialChips: 1000, SmallBlind: 5, BigBlind: 10}
-	r := NewRoom("ABC123", cfg, &Seat{SessionID: "host", Nickname: "host", IsHost: true}, time.Second, time.Second, nil)
+	r := NewRoom("ABC123", cfg, &Seat{SessionID: "host", Nickname: "host", IsHost: true}, time.Second, nil)
 	t.Cleanup(r.Shutdown)
 	testClient(t, r, "host", "host")
 	testClient(t, r, "p2", "p2")
@@ -159,7 +172,7 @@ func TestRoomReconnectKeepsSeat(t *testing.T) {
 
 func TestRoomSecondMatchResetsChips(t *testing.T) {
 	cfg := Config{Name: "test", MaxPlayers: 4, InitialChips: 1000, SmallBlind: 5, BigBlind: 10}
-	r := NewRoom("ABC123", cfg, &Seat{SessionID: "host-uuid", Nickname: "host", IsHost: true}, 10*time.Second, 200*time.Millisecond, nil)
+	r := NewRoom("ABC123", cfg, &Seat{SessionID: "host-uuid", Nickname: "host", IsHost: true}, 200*time.Millisecond, nil)
 	t.Cleanup(r.Shutdown)
 	testClient(t, r, "host-uuid", "host")
 	testClient(t, r, "p2-uuid", "p2")
@@ -214,10 +227,19 @@ func TestRoomAddBotAndPlay(t *testing.T) {
 	if r.Status() != StatusInProgress {
 		t.Fatalf("status = %v, want in_progress", r.Status())
 	}
-	// Bots act automatically: the hand must finish without human actions.
-	// A full street-by-street hand can take ~12s with bot delays.
-	waitForDur(t, 25*time.Second, func() bool {
+	// Bots act automatically; when it is the host's turn, fold for them
+	// (the host is the only human and there is no action timer anymore).
+	// A full street-by-street hand can take ~15s with bot delays.
+	foldResp := make(chan error, 1)
+	waitForDur(t, 30*time.Second, func() bool {
 		_, handOver := r.EngineStatus()
+		if !handOver && r.engine.CurrentIdx() == 0 {
+			r.Command(Command{Kind: CmdAction, SessionID: "host-uuid", Action: game.Action{Type: game.ActionFold}, Resp: foldResp})
+			if err := <-foldResp; err != nil {
+				t.Errorf("host fold failed: %v", err)
+			}
+		}
+		_, handOver = r.EngineStatus()
 		return handOver
 	}, "hand to finish with bots playing")
 
